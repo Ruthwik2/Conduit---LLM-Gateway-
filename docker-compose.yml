@@ -1,0 +1,100 @@
+# Full Conduit stack: the gateway plus everything it integrates with.
+#
+#   docker compose up --build
+#
+# With no config/conduit.yaml present, the gateway boots its zero-config default
+# (two mock providers, a demo key) but — because REDIS_URL and DATABASE_URL are
+# injected below — it transparently uses Redis for the exact cache / keys / rate
+# limits / budgets and pgvector for the semantic cache. So `up` alone gives you a
+# working, fully observable gateway with no API keys. To use real providers, copy
+# config/conduit.example.yaml to config/conduit.yaml and set the API-key env vars.
+
+services:
+  conduit:
+    build: .
+    container_name: conduit
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-dev-admin-token}"
+      DEMO_KEY: "${DEMO_KEY:-ck-demo-0000000000000000000000000000}"
+      REDIS_URL: "redis://redis:6379"
+      DATABASE_URL: "postgres://conduit:conduit@postgres:5432/conduit"
+      # Optional — set these (e.g. via a .env file) to enable real providers and
+      # OpenAI embeddings. Left empty, the gateway uses mocks + the hash embedder.
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    volumes:
+      # Mount your config in; if config/conduit.yaml exists it overrides the default.
+      - ./config:/app/config:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: conduit-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    # pgvector image ships the `vector` extension the semantic store needs.
+    image: pgvector/pgvector:pg16
+    container_name: conduit-postgres
+    environment:
+      POSTGRES_USER: conduit
+      POSTGRES_PASSWORD: conduit
+      POSTGRES_DB: conduit
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U conduit -d conduit"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: conduit-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - conduit
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: conduit-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  postgres-data:
+  prometheus-data:
+  grafana-data:

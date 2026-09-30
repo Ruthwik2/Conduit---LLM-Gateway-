@@ -1,0 +1,133 @@
+# Conduit configuration reference.
+#
+# Copy this to config/conduit.yaml (the default path the server looks for) and
+# edit to taste. Secrets are pulled from the environment via ${VAR} substitution,
+# so this file is safe to commit. Anything you omit falls back to a sensible
+# default — only `providers` and `routes` are strictly required.
+#
+#   cp config/conduit.example.yaml config/conduit.yaml
+#   OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-... npm start
+#
+# Env overrides applied on top of this file: PORT, LOG_LEVEL, ADMIN_TOKEN,
+# REDIS_URL (forces the redis backend), DATABASE_URL (forces pgvector).
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  logLevel: info
+  # Bearer token guarding /admin/* routes. ALWAYS override in production.
+  adminToken: ${ADMIN_TOKEN}
+  # Exposes POST /admin/mock/:name/behavior for the demo. Keep false in prod.
+  enableDemoControls: false
+
+# --- Upstream providers -----------------------------------------------------
+# Each provider is an adapter to an OpenAI-compatible or Anthropic endpoint. The
+# `name` is referenced by routes below. API keys come from the environment.
+providers:
+  - type: openai
+    name: openai-main
+    apiKey: ${OPENAI_API_KEY}
+    # baseURL: https://api.openai.com/v1   # or any OpenAI-compatible gateway
+
+  - type: anthropic
+    name: anthropic-main
+    apiKey: ${ANTHROPIC_API_KEY}
+    defaultMaxTokens: 1024   # Anthropic requires max_tokens; used if caller omits it
+
+  # A mock provider is handy as a always-available local fallback or for demos.
+  - type: mock
+    name: mock-fallback
+    behavior:
+      latencyMs: 40
+
+# --- Routes (model -> ordered failover targets) -----------------------------
+# A request for `model` is tried against each target in order, skipping unhealthy
+# ones (open circuit) and failing over on retriable errors. `model` under a
+# target overrides the upstream model name sent to that provider.
+routes:
+  - model: gpt-4o-mini
+    targets:
+      - provider: openai-main
+      - provider: mock-fallback        # last-resort so the route never hard-fails
+
+  - model: gpt-4o
+    targets:
+      - provider: openai-main
+
+  # Present an OpenAI model name to clients but serve it from Anthropic, with a
+  # second Anthropic-backed attempt as a different upstream model.
+  - model: claude-3-5-sonnet
+    targets:
+      - provider: anthropic-main
+        model: claude-3-5-sonnet-latest
+      - provider: anthropic-main
+        model: claude-3-5-haiku-latest
+
+# --- Routing / resilience ---------------------------------------------------
+router:
+  timeoutMs: 30000          # per-attempt upstream timeout
+  retriesPerTarget: 1       # same-provider retries before moving to the next target
+  backoff:
+    baseMs: 200
+    maxMs: 2000
+    jitter: true
+  circuitBreaker:
+    volumeThreshold: 5      # min calls in the window before the breaker may trip
+    errorThreshold: 0.5     # error rate (0..1) that opens the circuit
+    windowMs: 30000         # rolling health window
+    openStateMs: 15000      # how long to stay open before probing again
+    halfOpenSuccessThreshold: 2
+
+# --- Caching ----------------------------------------------------------------
+cache:
+  enabled: true
+  # "shared" (default): all virtual keys share one cache — maximum dedupe and
+  # savings. "per_key": entries are isolated per virtual key, so one tenant's
+  # answers are never replayed to another (choose this for multi-tenant setups
+  # where callers must not see each other's completions).
+  scope: shared
+  exact:
+    enabled: true
+    ttlSeconds: 3600
+  semantic:
+    enabled: true
+    ttlSeconds: 3600
+    similarityThreshold: 0.92   # cosine similarity required for a semantic hit
+    maxTemperature: 0.5         # skip semantic caching above this temperature
+    embeddingModel: text-embedding-3-small
+
+# --- Storage backends -------------------------------------------------------
+# `memory` is single-process (great for dev/tests). `redis` shares cache, keys,
+# rate limits and budgets across instances for horizontal scaling.
+stores:
+  backend: redis
+  redisUrl: ${REDIS_URL}
+
+# Semantic vector store. `memory` is a brute-force in-process index; `pgvector`
+# persists vectors in Postgres for scale and durability.
+semanticStore:
+  backend: pgvector
+  databaseUrl: ${DATABASE_URL}
+
+# --- Embeddings -------------------------------------------------------------
+# `hash` is a deterministic, network-free embedder (good for demos/tests).
+# `openai` uses a real embedding model — set dimensions to match it
+# (text-embedding-3-small = 1536).
+embeddings:
+  backend: openai
+  apiKey: ${OPENAI_API_KEY}
+  model: text-embedding-3-small
+  dimensions: 1536
+
+# --- Seed keys (bootstrapping) ----------------------------------------------
+# Plaintext virtual keys registered on boot. For real deployments prefer minting
+# keys via POST /admin/keys (the secret is shown once) rather than committing
+# them here. budgetUsd: null means unlimited.
+seedKeys:
+  - key: ${DEMO_KEY}
+    name: demo
+    budgetUsd: 50
+    rateLimit:
+      requestsPerMinute: 600
+      burst: 100
+    allowedModels: null     # null = all routed models; or a list to restrict
